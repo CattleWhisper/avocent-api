@@ -32,13 +32,13 @@ def get_pm_client():
     global pm
     if pm is None:
         pm = PMCommand()
-        try:
-            pm.login(PM_BASE_URL, PM_USERNAME, PM_PASSWORD)
-            logging.info(f"Successfully logged in to {PM_BASE_URL}")
-        except Exception as e:
-            logging.error(f"Failed to login: {e}")
-            pm = None
-            raise
+    try:
+        pm.login(PM_BASE_URL, PM_USERNAME, PM_PASSWORD)
+        logging.info(f"Successfully logged in to {PM_BASE_URL}")
+    except Exception as e:
+        logging.error(f"Failed to login: {e}")
+        pm = None
+        raise
     return pm
 
 
