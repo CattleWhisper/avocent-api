@@ -1,0 +1,180 @@
+# Copyright 2014 Mendix
+# MIT license, see LICENSE, see LICENSE
+
+import logging
+import ssl
+import xml.etree.ElementTree as et
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.ssl_ import create_urllib3_context
+import pmCommand
+import pmCommand.structures as structures
+
+requests.packages.urllib3.disable_warnings()
+
+
+# Custom adapter to allow legacy SSL/TLS with weak DH keys
+class LegacySSLAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        kwargs['ssl_context'] = ctx
+        return super().init_poolmanager(*args, **kwargs)
+
+
+class ACSClient:
+
+    def __init__(self):
+        self._sid = None
+        self._url = None
+        self._headers = {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        }
+        # Create a session with custom SSL adapter
+        self._session = requests.Session()
+        self._session.mount('https://', LegacySSLAdapter())
+
+    def _wrap(self, action, path=None, pathvar=None, payload=None):
+        # <avtrans>
+        avtrans = et.Element("avtrans")
+        # <sid>sid_if_logged_in</sid>
+        sid = et.SubElement(avtrans, "sid")
+        if self._sid is not None:
+            sid.text = self._sid
+        # <action>some_action</action>
+        action_element = et.SubElement(avtrans, "action")
+        action_element.text = action
+        # <agents><src>wmi</src><dest>controller</dest></agents>
+        agents = et.SubElement(avtrans, "agents")
+        et.SubElement(agents, "src").text = "wmi"
+        et.SubElement(agents, "dest").text = "controller"
+        if path is not None:
+            # <paths><path>foo.bar</path><pathvar>baz</pathvar></paths>
+            et_paths = et.SubElement(avtrans, "paths")
+            et.SubElement(et_paths, "path").text = path
+            if pathvar is not None:
+                et.SubElement(et_paths, "pathvar").text = pathvar
+        # wrap actual request
+        if payload is not None:
+            et_payload = et.SubElement(avtrans, "payload")
+            et_payload.append(payload)
+        # </avtrans>
+        return avtrans
+
+    def _request(self, action, path=None, pathvar=None, payload=None):
+        if self._url is None:
+            raise pmCommand.Error("Please login first.")
+
+        avtrans = self._wrap(action, path, pathvar, payload)
+        xml = et.tostring(avtrans)
+        logging.trace(">>> {}".format(xml))
+        response = self._session.post(self._url, data=xml, headers=self._headers, verify=False)
+        response.raise_for_status()
+        logging.trace("<<< {}".format(response.text))
+        et_response = et.fromstring(response.text)
+        et_error = et_response.find("./error")
+        if et_response.find("./action").text == "login" \
+                and action != "login" and action != "logout":
+            self._sid = None
+            raise pmCommand.Error("Invalid session, please login first.")
+        if et_error is not None:
+            raise pmCommand.Error("Error while handling {}: {}".format(
+                action, et_error.get("label")))
+        return et_response
+
+    def login(self, baseurl, username, password):
+        self._url = '{}/appliance/avtrans'.format(baseurl.rstrip('/'))
+        logging.debug("Logging into url {} as {}".format(self._url, username))
+
+        et_section = et.Element("section")
+        et_section.set("structure", "login")
+        parameter_username = et.SubElement(et_section, "parameter")
+        parameter_username.set("id", "username")
+        parameter_username.set("structure", "RWtext")
+        et.SubElement(parameter_username, "value").text = username
+        parameter_password = et.SubElement(et_section, "parameter")
+        parameter_password.set("id", "password")
+        parameter_password.set("structure", "password")
+        et.SubElement(parameter_password, "value").text = password
+
+        et_response = self._request('login', payload=et_section)
+        # if we end up here, the login was successful
+        sid = et_response.find("./sid").text
+        logging.debug("Login successful, got sid: {}".format(sid))
+        self._sid = sid
+
+        et_welcome = et_response.find("./payload/section[@id='welcome']")
+        welcome = et_welcome.find("./parameter[@id='welcome']/value").text
+        product = et_welcome.find("./parameter[@id='product']/value").text
+        return welcome, product
+
+    def logout(self):
+        et_response = self._request(action="logout")
+        if et_response.find("./action").text != 'login':
+            raise pmCommand.Error(
+                    "Logout failure. Please report this as a bug if you're able to reproduce it.")
+        logging.info("Logout successful.")
+        self._sid = None
+
+    def listipdus(self):
+        et_response = self._request(action="get",
+                                    path="units.powermanagement.pdu_management")
+        et_ipdus = et_response.findall("./payload/section[@id='pdu_devices_table']/array")
+        return [structures.PDU(et_ipdu) for et_ipdu in et_ipdus]
+
+    def outlets(self, pdu_id):
+        et_response = self._request(
+            action="get",
+            path="units.powermanagement.pdu_management.pduDevicesDetails.outletTable",
+            pathvar=pdu_id
+        )
+        et_outlets = et_response.findall("./payload/section[@id='outlet_details']/array")
+        return [structures.Outlet(et_outlet, pdu_id) for et_outlet in et_outlets]
+
+    def outlet_action(self, action, pdu_id, outlet_id):
+        et_section = et.Element("section")
+        et_section.set("structure", "table")
+        et_section.set("id", "outlet_details")
+        et_array = et.SubElement(et_section, "array")
+        et_array.set("id", outlet_id)
+
+        et_response = self._request(
+            action=action,
+            path="units.powermanagement.pdu_management"
+                 ".pduDevicesDetails.outletTable.Nazca_outlet_table",
+            pathvar=pdu_id,
+            payload=et_section
+        )
+        et_outlet = et_response.find("./payload/section[@id='outlet_details']"
+                                     "/array[@id='%s']" % outlet_id)
+        if et_outlet is None:
+            logging.error("Outlet {}[{}] not found.".format(pdu_id, outlet_id))
+        else:
+            outlet_name = et_outlet.find("./parameter[@id='outlet_name']/value").text
+            outlet_status = et_outlet.find("./parameter[@id='status']/value").text
+            logging.info("{}[{}]: status of outlet {} is now: {}".format(
+                pdu_id, outlet_id, outlet_name, outlet_status))
+
+    def save(self, pdu_id):
+        et_section = et.Element("section")
+        et_section.set("structure", "table")
+        et_section.set("id", "outlet_details")
+
+        self._request(
+            action="savepdu",
+            path="units.powermanagement.pdu_management.pduDevicesDetails"
+                 ".outletTable.Nazca_outlet_table",
+            pathvar=pdu_id,
+            payload=et_section
+        )
+
+    def get_session_idle_timeout(self):
+        et_response = self._request(
+            action="get",
+            path="units.applianceSettings.security.SecurityProfileNav"
+        )
+        return int(et_response.find("./payload/section[@id='securityProfile']"
+                                    "/parameter[@id='sessionTimeout']"
+                                    "/parameter[@id='idletimeout']/value").text)
